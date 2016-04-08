@@ -1,0 +1,137 @@
+#!/usr/bin/perl
+#
+# gbkFeatureSeq : Exporter for sequences of specified features from GenBank flat file.
+# Copyright (c) 2011-2014 Toshitaka Kumagai
+#
+# You can redistribute it and/or modify it under the terms of the
+# GNU General Public License, Version 2, dated June 1991,
+# as published by the Free Software Foundation.
+#
+# This script uses a code fragment from https://github.com/bioperl/bioperl-live/issues/88
+# to avoid a bug of BioPerl spliced_seq function.
+#
+
+use strict;
+use Bio::SeqIO;
+use Bio::SeqFeature::Generic;
+use Getopt::Std;
+
+my %opts;
+getopts('hi:o:F:I:D:pPg:q', \%opts);
+
+if ($opts{'h'}) {
+    print STDERR "usage: gbkFeatureSeq [options]\n";
+    print STDERR "  options:\n";
+    print STDERR "   -i in.gbk                  : GenBank filename in.\n";
+    print STDERR "   -o out.fa                  : FASTA filename out.\n";
+    print STDERR "   -F feature[,feature[,...]] : features to output.\n";
+    print STDERR "   -I tag[,tag[,...]]         : tag as a sequence ID.\n";
+    print STDERR "   -D tag[,tag[,...]]         : tag as a sequence description.\n";
+    print STDERR "   -p                         : translate CDS sequences.\n";
+    print STDERR "   -P                         : translate CDS and remove a stop codon at 3' tail.\n";
+    print STDERR "   -g trasl_table_id          : use codon table transl_table_id for translation.\n";
+    print STDERR "   -q                         : quiet mode.\n";
+    print STDERR "   -h                         : show this message.\n";
+    exit;
+}
+
+my $inFile = $opts{'i'};
+my $outFile = $opts{'o'};
+my $features = $opts{'F'};
+my $tagsForId = $opts{'I'};
+my $tagsForDescription = $opts{'D'};
+my $flagTranslate = $opts{'p'} || $opts{'P'} ? 1 : 0;
+my $trimTailStop = $opts{'P'} ? 1 : 0;
+my $geneticCode = $opts{'g'} ? $opts{'g'} : 1;
+my $verbose = $opts{'q'} ? -1 : 0;
+
+my $infp;
+if ($inFile) {
+    open($infp, '<', $inFile) or die "cannot open ${inFile} for read.\n";
+} else {
+    $infp = \*STDIN;
+}
+
+my $outfp;
+if ($outFile) {
+    open($outfp, '>', $outFile) or die "cannot open ${outFile} for write.\n";
+} else {
+    $outfp = \*STDOUT;
+}
+
+my @targetFeatures = split(/,/, $features);
+my @idTags = split(/,/, $tagsForId);
+my @descTags = split(/,/, $tagsForDescription);
+
+my ($sioIn, $sioOut);
+eval {
+    $sioOut = Bio::SeqIO->new(-fh => $outfp, -format => 'fasta');
+    my $oneEntry;
+    while(my $line = <$infp>) {
+	$oneEntry .= $line;
+	$line =~ s/[\r\n]//g;
+	if ($line =~ /^\/\/$/) {
+	    open(my $sfh, '<', \$oneEntry);
+	    $sioIn = Bio::SeqIO->new(-fh => $sfh, -format => 'genbank', -verbose => $verbose);
+	    process_one_entry($sioIn, $sioOut);
+	    $oneEntry = '';
+	}
+    }
+};
+if ($@) {
+    die "$@\n";
+}
+
+sub process_one_entry
+{
+    my ($sioIn, $sioOut) = @_;
+
+    foreach my $so ($sioIn->next_seq) {
+	foreach my $feat ($so->get_SeqFeatures) {
+	    my $primaryTag = $feat->primary_tag;
+	    next if (! (grep {$_ eq $primaryTag} @targetFeatures));
+	    my ($primaryId, $description);
+	    foreach my $t (@idTags) {
+		if ($feat->has_tag($t)) {
+		    $primaryId = ($feat->get_tag_values($t))[0];
+		    last;
+		}
+	    }
+	    foreach my $t (@descTags) {
+		if ($feat->has_tag($t)) {
+		    $description = ($feat->get_tag_values($t))[0];
+		    last;
+		}
+	    }
+
+	    my $splicedSeq;
+	    if ($feat->strand == -1 && $feat->location->isa('Bio::Location::SplitLocationI')
+		&& $feat->location->splittype eq 'JOIN') {
+		my $lagging_seq = '';
+		foreach ($feat->location->sub_Location()) {
+		    $splicedSeq = $feat->entire_seq->trunc($_->start, $_->end);
+		    $lagging_seq = $splicedSeq->revcom->seq . $lagging_seq;
+		}
+		$splicedSeq->seq($lagging_seq, 'dna');
+	    } else {
+		$splicedSeq = $feat->spliced_seq;
+	    }
+
+	    my $outputSeq;
+	    if ($flagTranslate and $primaryTag eq 'CDS') {
+		my $aa = $splicedSeq->translate(-codontable_id => $geneticCode)->seq;
+		$aa =~ s/\*$// if ($trimTailStop);
+		$outputSeq = Bio::Seq->new(
+		    -seq => $aa,
+		    -display_id => $primaryId,
+		    -description => $description );
+	    } else {
+		$outputSeq = Bio::Seq->new(
+		    -seq => $splicedSeq->seq,
+		    -display_id => $primaryId,
+		    -description => $description );
+	    }
+	    $sioOut->write_seq($outputSeq);
+	}
+    }
+}
